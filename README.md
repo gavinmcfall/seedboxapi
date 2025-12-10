@@ -24,7 +24,7 @@ env:
   - name: DEBUG
     value: "1"  # optional
   - name: METRICS_PORT
-    value: "8080"  # optional, default 8080
+    value: "9000"  # optional, default 9000
 ```
 
 ## Environment Variables
@@ -34,11 +34,11 @@ env:
 | `mam_id` | Yes | - | MAM session ID from Security preferences |
 | `interval` | No | 1 | Update interval in minutes |
 | `DEBUG` | No | - | Enable debug output |
-| `METRICS_PORT` | No | 8080 | Port for Prometheus metrics endpoint |
+| `METRICS_PORT` | No | 9000 | Port for Prometheus metrics endpoint |
 
 ## Prometheus Metrics
 
-Metrics are exposed at `http://localhost:8080/metrics`:
+Metrics are exposed at `http://localhost:9000/metrics`:
 
 | Metric | Type | Description |
 |--------|------|-------------|

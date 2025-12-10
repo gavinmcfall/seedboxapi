@@ -12,8 +12,8 @@ COOKIE_FILE=/config/MAM.cookies
 METRICS_FILE=/tmp/metrics.prom
 MAM_API_URL="https://t.myanonamouse.net/json/dynamicSeedbox.php"
 
-# Metrics port (default 8080)
-METRICS_PORT="${METRICS_PORT:-8080}"
+# Metrics port (default 9000)
+METRICS_PORT="${METRICS_PORT:-9000}"
 
 # Retry configuration
 MAX_RETRIES=3
