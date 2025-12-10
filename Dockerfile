@@ -1,7 +1,8 @@
 FROM alpine:latest
 
-RUN apk add curl
+RUN apk add --no-cache curl
 
-COPY wrapper.sh /
+COPY wrapper.sh /wrapper.sh
+RUN chmod +x /wrapper.sh
 
 ENTRYPOINT ["/wrapper.sh"]

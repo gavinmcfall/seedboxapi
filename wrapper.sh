@@ -1,120 +1,248 @@
 #!/bin/sh
 
-if [ "x$DEBUG" != "x" ]
-then
-	set -x
+if [ -n "$DEBUG" ]; then
+    set -x
 fi
 
-# The directory to store the two state files - /config is a docker standard
-CACHEFILE=/tmp/MAM.ip
-COOKIEFILE=/config/MAM.cookies
+# State files
+OLD_IP_FILE=/tmp/MAM.ip
+RESPONSE_FILE=/tmp/MAM.output
+TEMP_COOKIE_FILE=/tmp/MAM.cookies
+COOKIE_FILE=/config/MAM.cookies
+METRICS_FILE=/tmp/metrics.prom
+MAM_API_URL="https://t.myanonamouse.net/json/dynamicSeedbox.php"
 
-if [ "x$interval" == "x" ]
-then
-	echo Running with default interval of 1 minute
-	SLEEPTIME=60
+# Metrics port (default 8080)
+METRICS_PORT="${METRICS_PORT:-8080}"
+
+# Retry configuration
+MAX_RETRIES=3
+RETRY_DELAY=30
+
+# Curl timeouts
+CURL_CONNECT_TIMEOUT=10
+CURL_MAX_TIME=30
+
+# Metrics counters
+REFRESH_SUCCESS=0
+REFRESH_FAILED=0
+SESSION_RECREATE_SUCCESS=0
+SESSION_RECREATE_FAILED=0
+IP_CHANGES=0
+LAST_SUCCESS_TIMESTAMP=0
+
+# Logging with timestamps
+log() {
+    echo "[$(date '+%Y-%m-%d %H:%M:%S')] $*"
+}
+
+# Update metrics file
+update_metrics() {
+    LAST_SUCCESS_TIMESTAMP=$(date +%s)
+    cat > "${METRICS_FILE}" <<EOF
+# HELP seedboxapi_refresh_success_total Total successful IP refresh attempts
+# TYPE seedboxapi_refresh_success_total counter
+seedboxapi_refresh_success_total ${REFRESH_SUCCESS}
+
+# HELP seedboxapi_refresh_failed_total Total failed IP refresh attempts
+# TYPE seedboxapi_refresh_failed_total counter
+seedboxapi_refresh_failed_total ${REFRESH_FAILED}
+
+# HELP seedboxapi_session_recreate_success_total Total successful session recreations
+# TYPE seedboxapi_session_recreate_success_total counter
+seedboxapi_session_recreate_success_total ${SESSION_RECREATE_SUCCESS}
+
+# HELP seedboxapi_session_recreate_failed_total Total failed session recreations
+# TYPE seedboxapi_session_recreate_failed_total counter
+seedboxapi_session_recreate_failed_total ${SESSION_RECREATE_FAILED}
+
+# HELP seedboxapi_ip_changes_total Total IP address changes detected
+# TYPE seedboxapi_ip_changes_total counter
+seedboxapi_ip_changes_total ${IP_CHANGES}
+
+# HELP seedboxapi_last_success_timestamp_seconds Unix timestamp of last successful operation
+# TYPE seedboxapi_last_success_timestamp_seconds gauge
+seedboxapi_last_success_timestamp_seconds ${LAST_SUCCESS_TIMESTAMP}
+
+# HELP seedboxapi_up Whether the service is running (1 = up)
+# TYPE seedboxapi_up gauge
+seedboxapi_up 1
+EOF
+}
+
+# Start metrics HTTP server in background
+start_metrics_server() {
+    log "Starting metrics server on port ${METRICS_PORT}"
+    while true; do
+        {
+            echo -e "HTTP/1.1 200 OK\r\nContent-Type: text/plain; charset=utf-8\r\nConnection: close\r\n\r\n$(cat "${METRICS_FILE}" 2>/dev/null || echo '# No metrics yet')"
+        } | nc -l -p "${METRICS_PORT}" -q 1 >/dev/null 2>&1
+    done &
+    METRICS_PID=$!
+    log "Metrics server started (PID: ${METRICS_PID})"
+}
+
+# Get public IP with fallback providers
+get_public_ip() {
+    curl -s --connect-timeout "$CURL_CONNECT_TIMEOUT" --max-time "$CURL_MAX_TIME" ip4.me/api/ 2>/dev/null || \
+    curl -s --connect-timeout "$CURL_CONNECT_TIMEOUT" --max-time "$CURL_MAX_TIME" ifconfig.me 2>/dev/null || \
+    curl -s --connect-timeout "$CURL_CONNECT_TIMEOUT" --max-time "$CURL_MAX_TIME" icanhazip.com 2>/dev/null
+}
+
+# Interval configuration
+if [ -z "$interval" ]; then
+    log "Running with default interval of 1 minute"
+    SLEEPTIME=60
 else
-	if [ "$interval" -lt "1" ]
-	then
-		echo Cannot set interval to less than 1 minute
-		echo "  => Running with default interval of 60 seconds"
-		SLEEPTIME=60
-	else
-		echo Running with an interval of $interval minute\(s\)
-		SLEEPTIME=`expr $interval \* 60`
-	fi
+    if [ "$interval" -lt 1 ]; then
+        log "Cannot set interval to less than 1 minute"
+        log "  => Running with default interval of 60 seconds"
+        SLEEPTIME=60
+    else
+        log "Running with an interval of $interval minute(s)"
+        SLEEPTIME=$((interval * 60))
+    fi
 fi
 
-grep mam_id ${COOKIEFILE} > /dev/null 2>/dev/null
-if [ $? -ne 0 ]
-then
-	if [ "x$mam_id" == "x" ]
-	then
-		echo no mam_id, and no existing session.
-		exit 1
-	fi
+# Function to create session from mam_id
+create_session_from_mam_id() {
+    if [ -z "$mam_id" ]; then
+        log "No mam_id available to create session"
+        return 1
+    fi
 
-	echo No existing session, creating new cookie file using mam_id from environment
-	curl -s -b mam_id=${mam_id} -c ${COOKIEFILE} https://t.myanonamouse.net/json/dynamicSeedbox.php > /tmp/MAM.output
-	grep '"Success":true' /tmp/MAM.output > /dev/null 2>/dev/null
-  	if [ $? -ne 0 ]
-  	then
-		echo mam_id passed on command line is invalid
-		exit 1
-	else
-		grep mam_id ${COOKIEFILE} > /dev/null 2>/dev/null
-		if [ $? -ne 0 ]
-		then
-			echo Command successful, but failed to create cookie file.
-			exit 1
-		else
-			echo New session created.
-		fi
-	fi
+    log "Creating new session from mam_id..."
+    rm -f "${COOKIE_FILE}" "${TEMP_COOKIE_FILE}"
+    curl -s --connect-timeout "$CURL_CONNECT_TIMEOUT" --max-time "$CURL_MAX_TIME" \
+        -b "mam_id=${mam_id}" -c "${COOKIE_FILE}" "${MAM_API_URL}" > "${RESPONSE_FILE}"
+
+    if grep -q '"Success":true' "${RESPONSE_FILE}"; then
+        if grep -q mam_id "${COOKIE_FILE}"; then
+            log "New session created successfully"
+            SESSION_RECREATE_SUCCESS=$((SESSION_RECREATE_SUCCESS + 1))
+            update_metrics
+            return 0
+        else
+            log "Command successful, but failed to create cookie file"
+            SESSION_RECREATE_FAILED=$((SESSION_RECREATE_FAILED + 1))
+            update_metrics
+            return 1
+        fi
+    else
+        log "Failed to create session: $(cat "${RESPONSE_FILE}")"
+        SESSION_RECREATE_FAILED=$((SESSION_RECREATE_FAILED + 1))
+        update_metrics
+        return 1
+    fi
+}
+
+# Function to create session with retries
+create_session_with_retry() {
+    retry_count=0
+    while ! create_session_from_mam_id; do
+        retry_count=$((retry_count + 1))
+        if [ "$retry_count" -ge "$MAX_RETRIES" ]; then
+            log "Failed after $MAX_RETRIES attempts"
+            return 1
+        fi
+        log "Retry $retry_count/$MAX_RETRIES in $RETRY_DELAY seconds..."
+        sleep "$RETRY_DELAY"
+    done
+    return 0
+}
+
+# Initialize metrics file and start server
+update_metrics
+start_metrics_server
+
+# Initial session check/creation
+if ! grep -q mam_id "${COOKIE_FILE}" 2>/dev/null; then
+    log "No existing session found"
+    if ! create_session_with_retry; then
+        exit 1
+    fi
 else
-	curl -s -b ${COOKIEFILE} -c ${COOKIEFILE} https://t.myanonamouse.net/json/dynamicSeedbox.php > /tmp/MAM.output
-	grep '"Success":true' /tmp/MAM.output > /dev/null 2>/dev/null
-  	if [ $? -ne 0 ]
-  	then
-		echo response: `cat /tmp/MAM.output`
-		echo Current cookie file is invalid.  Please delete it, set the mam_id, and restart the container.
-		exit 1
-	else
-		echo Session is valid
-	fi
-
+    # Test existing cookie
+    curl -s --connect-timeout "$CURL_CONNECT_TIMEOUT" --max-time "$CURL_MAX_TIME" \
+        -b "${COOKIE_FILE}" -c "${COOKIE_FILE}" "${MAM_API_URL}" > "${RESPONSE_FILE}"
+    if ! grep -q '"Success":true' "${RESPONSE_FILE}"; then
+        log "Existing cookie invalid: $(cat "${RESPONSE_FILE}")"
+        log "Attempting to recreate session..."
+        if ! create_session_with_retry; then
+            exit 1
+        fi
+    else
+        log "Existing session is valid"
+        REFRESH_SUCCESS=$((REFRESH_SUCCESS + 1))
+        update_metrics
+    fi
 fi
 
-OLDIP=`cat $CACHEFILE 2>/dev/null`
+# Main loop
+while true; do
+    OLD_IP=$(cat "${OLD_IP_FILE}" 2>/dev/null)
+    RAW_IP=$(get_public_ip)
 
-while [ $PPID -ne 1 ]
-do
-	OLDIP=`cat $CACHEFILE 2>/dev/null`
+    if [ -z "$RAW_IP" ]; then
+        log "Failed to get public IP, retrying next interval"
+        REFRESH_FAILED=$((REFRESH_FAILED + 1))
+        update_metrics
+        sleep "$SLEEPTIME"
+        continue
+    fi
 
-	NEWIP=`curl -s ip4.me/api/ | md5sum - | awk '{print $1}'`
-	if [ "x$DEBUG" != "x" ]
-	then
-		echo Current IP:  `curl -s ip4.me/api/`
-	fi
-	
-	# Check to see if the IP address has changed
-	if [ "${OLDIP}" != "${NEWIP}" ]
-	then
-  		echo New IP detected
-  		curl -s -b $COOKIEFILE -c $COOKIEFILE https://t.myanonamouse.net/json/dynamicSeedbox.php > /tmp/MAM.output
+    NEW_IP=$(echo "$RAW_IP" | md5sum | awk '{print $1}')
 
-		grep -E 'No Session Cookie|Invalid session' /tmp/MAM.output > /dev/null 2>/dev/null
-		if [ $? -eq 0 ]
-		then
-			echo response: `cat /tmp/MAM.output`
-			echo Current cookie file is invalid.  Please delete it, set the mam_id, and restart the container.
-			exit 1
-		fi
-	
-  		# If that command worked, and we therefore got the success message
-  		# from MAM, update the CACHEFILE for the next execution
-		grep '"Success":true' /tmp/MAM.output > /dev/null 2>/dev/null
-  		if [ $? -eq 0 ]
-  		then
-			echo Response:  \"`cat /tmp/MAM.output`\"
-    			echo $NEWIP > $CACHEFILE
-			OLDPID=$NEWIP
-		else
-			grep 'Last change too recent' /tmp/MAM.output > /dev/null 2>/dev/null
-			if [ $? -eq 0 ]
-			then
-				echo Last update too recent - sleeping
-			else
-				echo response: `cat /tmp/MAM.output`
-				echo Invalid response
-				exit 1
-			fi
-  		fi
-	else
-		echo "No IP change detected: `date`"
-	fi
-	sleep $SLEEPTIME
+    if [ -n "$DEBUG" ]; then
+        log "Current IP: $RAW_IP"
+    fi
 
-	# Empty the IP file if it has not been rotated for more than 30 days, this will enforce session freshness.
-	find $CACHEFILE -mtime +30 -delete
+    # Check if IP changed
+    if [ "$OLD_IP" != "$NEW_IP" ]; then
+        log "New IP detected"
+        IP_CHANGES=$((IP_CHANGES + 1))
+
+        # Save to temp file to prevent corruption on failure
+        curl -s --connect-timeout "$CURL_CONNECT_TIMEOUT" --max-time "$CURL_MAX_TIME" \
+            -b "${COOKIE_FILE}" -c "${TEMP_COOKIE_FILE}" "${MAM_API_URL}" > "${RESPONSE_FILE}"
+
+        if grep -qE 'No Session Cookie|Invalid session' "${RESPONSE_FILE}"; then
+            log "Session invalid: $(cat "${RESPONSE_FILE}")"
+            log "Attempting to recreate session..."
+            REFRESH_FAILED=$((REFRESH_FAILED + 1))
+            update_metrics
+            if ! create_session_with_retry; then
+                exit 1
+            fi
+            continue
+        fi
+
+        if grep -q '"Success":true' "${RESPONSE_FILE}"; then
+            log "Response: $(cat "${RESPONSE_FILE}")"
+            mv "${TEMP_COOKIE_FILE}" "${COOKIE_FILE}"
+            echo "$NEW_IP" > "${OLD_IP_FILE}"
+            REFRESH_SUCCESS=$((REFRESH_SUCCESS + 1))
+            update_metrics
+        elif grep -q "Last change too recent" "${RESPONSE_FILE}"; then
+            log "Last update too recent - sleeping"
+            rm -f "${TEMP_COOKIE_FILE}"
+        else
+            log "Invalid response: $(cat "${RESPONSE_FILE}")"
+            rm -f "${TEMP_COOKIE_FILE}"
+            REFRESH_FAILED=$((REFRESH_FAILED + 1))
+            update_metrics
+            # Try to recover instead of exiting
+            log "Attempting to recreate session..."
+            if ! create_session_with_retry; then
+                exit 1
+            fi
+        fi
+    else
+        log "No IP change detected"
+    fi
+
+    sleep "$SLEEPTIME"
+
+    # Enforce session freshness after 30 days
+    find "${OLD_IP_FILE}" -mtime +30 -delete 2>/dev/null
 done
