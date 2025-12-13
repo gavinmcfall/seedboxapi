@@ -1,9 +1,5 @@
 #!/bin/sh
 
-if [ -n "$DEBUG" ]; then
-    set -x
-fi
-
 # State files
 OLD_IP_FILE=/tmp/MAM.ip
 RESPONSE_FILE=/tmp/MAM.output
@@ -70,14 +66,12 @@ seedboxapi_up 1
 EOF
 }
 
-# Start metrics HTTP server in background
+# Start metrics HTTP server in background using busybox httpd
 start_metrics_server() {
     log "Starting metrics server on port ${METRICS_PORT}"
-    while true; do
-        {
-            echo -e "HTTP/1.1 200 OK\r\nContent-Type: text/plain; charset=utf-8\r\nConnection: close\r\n\r\n$(cat "${METRICS_FILE}" 2>/dev/null || echo '# No metrics yet')"
-        } | nc -l -p "${METRICS_PORT}" -q 1 >/dev/null 2>&1
-    done &
+    mkdir -p /tmp/metrics
+    ln -sf "${METRICS_FILE}" /tmp/metrics/metrics
+    httpd -f -p "${METRICS_PORT}" -h /tmp/metrics &
     METRICS_PID=$!
     log "Metrics server started (PID: ${METRICS_PID})"
 }
@@ -192,10 +186,6 @@ while true; do
     fi
 
     NEW_IP=$(echo "$RAW_IP" | md5sum | awk '{print $1}')
-
-    if [ -n "$DEBUG" ]; then
-        log "Current IP: $RAW_IP"
-    fi
 
     # Check if IP changed
     if [ "$OLD_IP" != "$NEW_IP" ]; then
