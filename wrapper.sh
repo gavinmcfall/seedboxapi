@@ -66,12 +66,17 @@ seedboxapi_up 1
 EOF
 }
 
-# Start metrics HTTP server in background using busybox httpd
+# Start metrics HTTP server in background
 start_metrics_server() {
     log "Starting metrics server on port ${METRICS_PORT}"
-    mkdir -p /tmp/metrics
-    ln -sf "${METRICS_FILE}" /tmp/metrics/metrics
-    httpd -f -p "${METRICS_PORT}" -h /tmp/metrics &
+    # Use a shell loop with netcat to serve metrics with proper Content-Type header
+    (
+        while true; do
+            {
+                echo -e "HTTP/1.1 200 OK\r\nContent-Type: text/plain; charset=utf-8\r\nConnection: close\r\n\r\n$(cat "${METRICS_FILE}" 2>/dev/null)"
+            } | nc -l -p "${METRICS_PORT}" -q 1 > /dev/null 2>&1
+        done
+    ) &
     METRICS_PID=$!
     log "Metrics server started (PID: ${METRICS_PID})"
 }
