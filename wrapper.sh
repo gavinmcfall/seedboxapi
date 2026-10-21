@@ -1,19 +1,20 @@
 #!/bin/sh
 
-# State files
-OLD_IP_FILE=/tmp/MAM.ip
-RESPONSE_FILE=/tmp/MAM.output
-TEMP_COOKIE_FILE=/tmp/MAM.cookies
-COOKIE_FILE=/config/MAM.cookies
-METRICS_FILE=/tmp/metrics.prom
+# State files. Overridable so the session-handling paths can be exercised in a
+# sandbox; defaults are the container's real locations.
+OLD_IP_FILE="${OLD_IP_FILE:-/tmp/MAM.ip}"
+RESPONSE_FILE="${RESPONSE_FILE:-/tmp/MAM.output}"
+TEMP_COOKIE_FILE="${TEMP_COOKIE_FILE:-/tmp/MAM.cookies}"
+COOKIE_FILE="${COOKIE_FILE:-/config/MAM.cookies}"
+METRICS_FILE="${METRICS_FILE:-/tmp/metrics.prom}"
 MAM_API_URL="https://t.myanonamouse.net/json/dynamicSeedbox.php"
 
 # Metrics port (default 9000)
 METRICS_PORT="${METRICS_PORT:-9000}"
 
-# Retry configuration
-MAX_RETRIES=3
-RETRY_DELAY=30
+# Retry configuration (overridable so tests do not have to wait out real delays)
+MAX_RETRIES="${MAX_RETRIES:-3}"
+RETRY_DELAY="${RETRY_DELAY:-30}"
 
 # Curl timeouts
 CURL_CONNECT_TIMEOUT=10
@@ -111,24 +112,32 @@ create_session_from_mam_id() {
     fi
 
     log "Creating new session from mam_id..."
-    rm -f "${COOKIE_FILE}" "${TEMP_COOKIE_FILE}"
+    # Write to the temp jar, never to COOKIE_FILE directly. MAM rotates the
+    # mam_id when a session is created from it, so the configured seed value
+    # goes stale after first use. If we cleared COOKIE_FILE before finding out
+    # whether the seed still works, one transient failure would destroy the
+    # only working credential and leave no way back without a new mam_id.
+    rm -f "${TEMP_COOKIE_FILE}"
     curl -s --connect-timeout "$CURL_CONNECT_TIMEOUT" --max-time "$CURL_MAX_TIME" \
-        -b "mam_id=${mam_id}" -c "${COOKIE_FILE}" "${MAM_API_URL}" > "${RESPONSE_FILE}"
+        -b "mam_id=${mam_id}" -c "${TEMP_COOKIE_FILE}" "${MAM_API_URL}" > "${RESPONSE_FILE}"
 
     if grep -q '"Success":true' "${RESPONSE_FILE}"; then
-        if grep -q mam_id "${COOKIE_FILE}"; then
+        if grep -q mam_id "${TEMP_COOKIE_FILE}" 2>/dev/null; then
+            mv "${TEMP_COOKIE_FILE}" "${COOKIE_FILE}"
             log "New session created successfully"
             SESSION_RECREATE_SUCCESS=$((SESSION_RECREATE_SUCCESS + 1))
             update_metrics
             return 0
         else
             log "Command successful, but failed to create cookie file"
+            rm -f "${TEMP_COOKIE_FILE}"
             SESSION_RECREATE_FAILED=$((SESSION_RECREATE_FAILED + 1))
             update_metrics
             return 1
         fi
     else
         log "Failed to create session: $(cat "${RESPONSE_FILE}")"
+        rm -f "${TEMP_COOKIE_FILE}"
         SESSION_RECREATE_FAILED=$((SESSION_RECREATE_FAILED + 1))
         update_metrics
         return 1
@@ -157,20 +166,25 @@ start_metrics_server
 # Initial session check/creation
 if ! grep -q mam_id "${COOKIE_FILE}" 2>/dev/null; then
     log "No existing session found"
-    if ! create_session_with_retry; then
-        exit 1
-    fi
+    # Do not exit on failure. Exiting crashloops the container, which takes the
+    # metrics server down with it and leaves the failure invisible to
+    # Prometheus. Staying up and exporting
+    # seedboxapi_session_recreate_failed_total is what makes this alertable.
+    create_session_with_retry || log "Could not establish a session; will retry each interval"
 else
-    # Test existing cookie
+    # Test the existing cookie, writing the refreshed jar to the temp file so a
+    # failed probe cannot overwrite a good session (same pattern as the main
+    # loop below).
+    rm -f "${TEMP_COOKIE_FILE}"
     curl -s --connect-timeout "$CURL_CONNECT_TIMEOUT" --max-time "$CURL_MAX_TIME" \
-        -b "${COOKIE_FILE}" -c "${COOKIE_FILE}" "${MAM_API_URL}" > "${RESPONSE_FILE}"
+        -b "${COOKIE_FILE}" -c "${TEMP_COOKIE_FILE}" "${MAM_API_URL}" > "${RESPONSE_FILE}"
     if ! grep -q '"Success":true' "${RESPONSE_FILE}"; then
+        rm -f "${TEMP_COOKIE_FILE}"
         log "Existing cookie invalid: $(cat "${RESPONSE_FILE}")"
         log "Attempting to recreate session..."
-        if ! create_session_with_retry; then
-            exit 1
-        fi
+        create_session_with_retry || log "Could not establish a session; will retry each interval"
     else
+        [ -s "${TEMP_COOKIE_FILE}" ] && mv "${TEMP_COOKIE_FILE}" "${COOKIE_FILE}"
         log "Existing session is valid"
         REFRESH_SUCCESS=$((REFRESH_SUCCESS + 1))
         update_metrics
@@ -206,9 +220,8 @@ while true; do
             log "Attempting to recreate session..."
             REFRESH_FAILED=$((REFRESH_FAILED + 1))
             update_metrics
-            if ! create_session_with_retry; then
-                exit 1
-            fi
+            create_session_with_retry || log "Could not establish a session; will retry each interval"
+            sleep "$SLEEPTIME"
             continue
         fi
 
@@ -228,9 +241,7 @@ while true; do
             update_metrics
             # Try to recover instead of exiting
             log "Attempting to recreate session..."
-            if ! create_session_with_retry; then
-                exit 1
-            fi
+            create_session_with_retry || log "Could not establish a session; will retry each interval"
         fi
     else
         log "No IP change detected"

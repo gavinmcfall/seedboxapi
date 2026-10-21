@@ -1,0 +1,5 @@
+# These scripts are COPYed into an Alpine image and run by /bin/sh. A CR in the
+# shebang makes the interpreter unresolvable ("bad interpreter"), so the line
+# endings must stay LF regardless of the committer's core.autocrlf setting.
+*.sh text eol=lf
+Dockerfile text eol=lf
